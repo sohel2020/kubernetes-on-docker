@@ -1,0 +1,129 @@
+#!/bin/bash
+set -e
+
+url="https://get.docker.com/"
+apt_url="https://apt.dockerproject.org"
+yum_url="https://yum.dockerproject.org"
+gpg_fingerprint="58118E89F3A912897C070ADBF76221572C52609D"
+
+key_servers="
+ha.pool.sks-keyservers.net
+pgp.mit.edu
+keyserver.ubuntu.com
+"
+
+
+command_exists() {
+	command -v "$@" > /dev/null 2>&1
+}
+
+rpm_import_repository_key() {
+	local key=$1; shift
+	local tmpdir=$(mktemp -d)
+	chmod 600 "$tmpdir"
+	for key_server in $key_servers ; do
+		gpg --homedir "$tmpdir" --keyserver "$key_server" --recv-keys "$key" && break
+	done
+	gpg --homedir "$tmpdir" -k "$key" >/dev/null
+	gpg --homedir "$tmpdir" --export --armor "$key" > "$tmpdir"/repo.key
+	rpm --import "$tmpdir"/repo.key
+	rm -rf "$tmpdir"
+}
+
+
+
+do_install() {
+lsb_dist=$(lsb_release -i | awk {'print $3'}| tr '[:upper:]' '[:lower:]')
+user="$(id -un 2>/dev/null || true)"
+
+sh_c='sh -c'
+if [ "$user" != 'root' ]; then
+	if command_exists sudo; then
+		sh_c='sudo -E sh -c'
+	elif command_exists su; then
+		sh_c='su -c'
+	else
+		cat >&2 <<-'EOF'
+		Error: this installer needs the ability to run commands as root.
+		We are unable to find either "sudo" or "su" available to make this happen.
+		EOF
+		exit 1
+	fi
+fi
+
+if command_exists lsb_release; then
+	dist_version="$(lsb_release --codename | cut -f2)"
+	fi
+	if [ -z "$dist_version" ] && [ -r /etc/lsb-release ]; then
+		dist_version="$(. /etc/lsb-release && echo "$DISTRIB_CODENAME")"
+	fi
+
+export DEBIAN_FRONTEND=noninteractive
+
+did_apt_get_update=
+apt_get_update() {
+	if [ -z "$did_apt_get_update" ]; then
+		( set -x; $sh_c 'sleep 3; apt-get update' )
+		did_apt_get_update=1
+	fi
+}
+
+# aufs is preferred over devicemapper; try to ensure the driver is available.
+if ! grep -q aufs /proc/filesystems && ! $sh_c 'modprobe aufs'; then
+	if uname -r | grep -q -- '-generic' && dpkg -l 'linux-image-*-generic' | grep -qE '^ii|^hi' 2>/dev/null; then
+		kern_extras="linux-image-extra-$(uname -r) linux-image-extra-virtual"
+
+		apt_get_update
+		( set -x; $sh_c 'sleep 3; apt-get install -y -q '"$kern_extras" ) || true
+
+		if ! grep -q aufs /proc/filesystems && ! $sh_c 'modprobe aufs'; then
+			echo >&2 'Warning: tried to install '"$kern_extras"' (for AUFS)'
+			echo >&2 ' but we still have no AUFS.  Docker may not work. Proceeding anyways!'
+			( set -x; sleep 10 )
+		fi
+	else
+		echo >&2 'Warning: current kernel is not supported by the linux-image-extra-virtual'
+		echo >&2 ' package.  We have no AUFS support.  Consider installing the packages'
+		echo >&2 ' linux-image-virtual kernel and linux-image-extra-virtual for AUFS support.'
+		( set -x; sleep 10 )
+	fi
+fi
+
+# install apparmor utils if they're missing and apparmor is enabled in the kernel
+# otherwise Docker will fail to start
+if [ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" = 'Y' ]; then
+	if command -v apparmor_parser >/dev/null 2>&1; then
+		echo 'apparmor is enabled in the kernel and apparmor utils were already installed'
+	else
+		echo 'apparmor is enabled in the kernel, but apparmor_parser missing'
+		apt_get_update
+		( set -x; $sh_c 'sleep 3; apt-get install -y -q apparmor' )
+	fi
+fi
+
+if [ ! -e /usr/lib/apt/methods/https ]; then
+	apt_get_update
+	( set -x; $sh_c 'sleep 3; apt-get install -y -q apt-transport-https ca-certificates' )
+fi
+if [ -z "$curl" ]; then
+	apt_get_update
+	( set -x; $sh_c 'sleep 3; apt-get install -y -q curl ca-certificates' )
+	curl='curl -sSL'
+fi
+(
+set -x
+for key_server in $key_servers ; do
+	$sh_c "apt-key adv --keyserver hkp://${key_server}:80 --recv-keys ${gpg_fingerprint}" && break
+done
+$sh_c "apt-key adv -k ${gpg_fingerprint} >/dev/null"
+$sh_c "mkdir -p /etc/apt/sources.list.d"
+$sh_c "echo deb \[arch=$(dpkg --print-architecture)\] ${apt_url}/repo ${lsb_dist}-${dist_version} main > /etc/apt/sources.list.d/docker.list"
+$sh_c 'sleep 3; apt-get update; apt-get install -y -q docker-engine'
+)
+sudo usermod -aG docker $USER
+exit 0
+}
+
+do_install
+
+
